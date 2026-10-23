@@ -3,7 +3,7 @@
   "private": true,
   "version": "0.0.0",
   "type": "module",
-  "homepage": "https://hsiao840412.github.io/GSXStatusCheckWeb",
+  "homepage": "https://doghsiao412.github.io/GSXStatusCheckWeb",
   "scripts": {
     "dev": "vite",
     "build": "vite build",

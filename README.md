@@ -4,7 +4,7 @@
 ![React](https://img.shields.io/badge/React-20232A?style=flat-square&logo=react&logoColor=61DAFB)
 ![TailwindCSS](https://img.shields.io/badge/Tailwind_CSS-38B2AC?style=flat-square&logo=tailwind-css&logoColor=white)
 
-[GSX-Status-Check](https://github.com/hsiao840412/GSX-Status-Check/) 的網頁版，擺脫系統依賴方便使用
+GSX-Status-Check 的網頁版，擺脫系統依賴方便使用
 
 簡單的 Web 工具，用來比對 **SA 報表** 與 **GSX 檔案**。它能自動抓出那些「SA 已經領回但 GSX 還沒關單」或是「SA 已經修好但 GSX 狀態還沒改」的案件。
 
