@@ -4,7 +4,7 @@
 ![React](https://img.shields.io/badge/React-20232A?style=flat-square&logo=react&logoColor=61DAFB)
 ![TailwindCSS](https://img.shields.io/badge/Tailwind_CSS-38B2AC?style=flat-square&logo=tailwind-css&logoColor=white)
 
-[GSX-Status-Check](https://github.com/hsiao840412/GSX-Status-Check/) 的網頁版，擺脫系統依賴方便使用
+GSX-Status-Check 的網頁版，擺脫系統依賴方便使用
 
 簡單的 Web 工具，用來比對 **SA 報表** 與 **GSX 檔案**。它能自動抓出那些「SA 已經領回但 GSX 還沒關單」或是「SA 已經修好但 GSX 狀態還沒改」的案件。
 
@@ -23,5 +23,7 @@
 
 ### 📌 注意事項
 * **欄位需求**：SA 報表必須包含「單號、狀態」；GSX 報表必須包含「採購訂單、維修、維修狀態」。
+* **更換報表**：選擇或拖入檔案後會清除先前的比對結果與勾選，請重新比對。
+* **重複單號**：依現有比對規則忽略大小寫、前後空白及「-」後綴後，若 SA 單號或 GSX 採購訂單重複，會列出來源、資料序號與狀態（序號不含標題及空白列）。該組案件不納入自動比對與匯出，其餘案件照常處理。
 
 **資料只會在瀏覽器端執行，不會上傳至網路！！**

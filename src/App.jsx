@@ -1,8 +1,8 @@
 import React, { useMemo, useRef, useState } from "react";
 
-const VERSION = "v1.6";
-const SA_READY_STATUS = ["抵達門市", "工程師完成"];
-const SA_CLOSED_STATUS = ["顧客領回"];
+import { analyzeReports, emptyResults } from "./reportAnalysis.js";
+
+const VERSION = "v1.7";
 const GSX_REQUIRED_STATUSES = [
   "已退回更換完成的設備",
   "已退回濫用的設備",
@@ -16,6 +16,9 @@ const GSX_REQUIRED_STATUSES = [
   "退回 - 無購買證明",
   "退回 - 遭竄改",
 ];
+
+const rmaTicketUrl = (rmaID) =>
+  `https://rma0.studioarma.com/rma/?m=ticket-common&op=view&id=${encodeURIComponent(rmaID)}`;
 
 const Icon = ({ name, size = 18 }) => {
   const common = {
@@ -148,7 +151,10 @@ function FileDropZone({ title, hint, fileName, onFile }) {
         ref={inputRef}
         type="file"
         accept=".csv,.txt,text/csv"
-        onChange={(event) => accept(event.target.files?.[0])}
+        onChange={(event) => {
+          accept(event.target.files?.[0]);
+          event.target.value = "";
+        }}
       />
       <div className="file-icon">
         <Icon name={fileName ? "check" : "upload"} size={20} />
@@ -177,12 +183,9 @@ export default function App() {
   const [gsxFileName, setGsxFileName] = useState("");
   const [isAnalyzing, setIsAnalyzing] = useState(false);
   const [statusMessage, setStatusMessage] = useState("等待選擇兩份報表");
-  const [results, setResults] = useState({
-    unclosed: [],
-    notReady: [],
-    mismatch: [],
-    all: [],
-  });
+  const [results, setResults] = useState(emptyResults);
+  const analysisTimer = useRef(null);
+  const fileReaders = useRef({ SA: null, GSX: null });
   const [selectedTab, setSelectedTab] = useState(0);
   const [selectedIDs, setSelectedIDs] = useState(new Set());
   const [toast, setToast] = useState({ show: false, message: "" });
@@ -206,10 +209,30 @@ export default function App() {
   };
   const loadFile = (file, type) => {
     if (!file) return;
-    if (type === "SA") setSaFileName(file.name);
-    else setGsxFileName(file.name);
+    window.clearTimeout(analysisTimer.current);
+    setIsAnalyzing(false);
+    setResults(emptyResults());
+    setSelectedIDs(new Set());
+    setSelectedTab(0);
+    setStatusMessage(`正在載入 ${type} 報表，請重新比對`);
+    if (type === "SA") {
+      setSaFileName(file.name);
+      setSaData([]);
+      setSaHeaders([]);
+    } else {
+      setGsxFileName(file.name);
+      setGsxData([]);
+      setGsxHeaders([]);
+    }
+    fileReaders.current[type]?.abort();
     const reader = new FileReader();
+    fileReaders.current[type] = reader;
+    reader.onerror = () => {
+      if (fileReaders.current[type] !== reader) return;
+      setStatusMessage(`${type} 報表讀取失敗，請重新選擇檔案`);
+    };
     reader.onload = (event) => {
+      if (fileReaders.current[type] !== reader) return;
       const buffer = event.target.result;
       let content = new TextDecoder("utf-8").decode(buffer);
       const looksUtf8 =
@@ -232,7 +255,7 @@ export default function App() {
         setGsxHeaders(parsed.headers);
       }
       setStatusMessage(
-        `${type} 載入成功 · ${parsed.data.length.toLocaleString()} 筆資料`,
+        `${type} 載入成功 · ${parsed.data.length.toLocaleString()} 筆資料，請重新比對`,
       );
     };
     reader.readAsArrayBuffer(file);
@@ -245,7 +268,7 @@ export default function App() {
     setIsAnalyzing(true);
     setStatusMessage("正在比對資料…");
     setSelectedIDs(new Set());
-    window.setTimeout(() => {
+    analysisTimer.current = window.setTimeout(() => {
       const rKey = saHeaders.find((header) => header === "單號");
       const sKey = saHeaders.find((header) => header === "狀態");
       if (!rKey || !sKey) {
@@ -273,74 +296,18 @@ export default function App() {
         );
         return;
       }
-      const gsxMap = {};
-      gsxData.forEach((row) => {
-        const po = row[poH];
-        if (po) gsxMap[po.toUpperCase().split("-")[0].trim()] = row;
+      const nextResults = analyzeReports(saData, gsxData, {
+        rKey, sKey, poH, idH, statusH,
       });
-      const unclosed = [];
-      const notReady = [];
-      const mismatch = [];
-      const all = [];
-      let matches = 0;
-      saData.forEach((sa, index) => {
-        const rmaID = sa[rKey];
-        const saStatus = sa[sKey];
-        if (!rmaID || !saStatus) return;
-        const gsx = gsxMap[rmaID.toUpperCase().split("-")[0].trim()];
-        if (!gsx) return;
-        matches += 1;
-        const gsxStatus = (gsx[statusH] || "").trim();
-        const record = {
-          id: `${index}-${rmaID}-${gsx[idH] || ""}`,
-          gsxID: gsx[idH] || "-",
-          rmaID,
-          saStatus,
-          gsxStatus,
-          isAnomaly: false,
-          reason: "",
-        };
-        const gsxClosed = gsxStatus.includes("已由系統關閉");
-        const gsxReady = gsxStatus.includes("待取件");
-        const saClosed = SA_CLOSED_STATUS.includes(saStatus);
-        const saReady = SA_READY_STATUS.includes(saStatus);
-        if (saClosed && !gsxClosed) {
-          const item = {
-            ...record,
-            isAnomaly: true,
-            reason: "SA 已領回，但 GSX 尚未關閉",
-          };
-          unclosed.push(item);
-        }
-        if (saReady && !gsxReady && !gsxClosed) {
-          const item = {
-            ...record,
-            isAnomaly: true,
-            reason: "SA 已完修，但 GSX 狀態未更新",
-          };
-          notReady.push(item);
-        }
-        if (
-          (gsxReady || gsxClosed) &&
-          ![...SA_READY_STATUS, ...SA_CLOSED_STATUS, "寄送到門市"].includes(
-            saStatus,
-          )
-        ) {
-          const item = {
-            ...record,
-            isAnomaly: true,
-            reason: "GSX 已完成／待取，但 SA 進度落後",
-          };
-          mismatch.push(item);
-        }
-        all.push(record);
-      });
-      setResults({ unclosed, notReady, mismatch, all });
-      setSelectedIDs(new Set(unclosed.map((row) => row.id)));
+      setResults(nextResults);
+      setSelectedIDs(new Set(nextResults.unclosed.map((row) => row.id)));
       setIsAnalyzing(false);
       setSelectedTab(0);
       setStatusMessage(
-        `分析完成 · 成功匹配 ${matches.toLocaleString()} 筆資料`,
+        `分析完成 · 成功匹配 ${nextResults.all.length.toLocaleString()} 筆資料` +
+          (nextResults.duplicates.length
+            ? ` · ${nextResults.duplicates.length} 組重複單號已排除`
+            : ""),
       );
     }, 380);
   };
@@ -507,6 +474,33 @@ export default function App() {
               ))}
             </div>
           </div>
+          {results.duplicates.length > 0 && (
+            <aside className="duplicate-warning" aria-labelledby="duplicate-title">
+              <h3 id="duplicate-title">
+                <Icon name="alert" size={17} />
+                發現 {results.duplicates.length} 組重複單號
+              </h3>
+              <p>以下單號未納入自動比對與匯出，請先確認報表。比對單號會忽略大小寫、前後空白及「-」後綴。</p>
+              <details>
+                <summary>查看重複明細</summary>
+                <div className="duplicate-details">
+                  {results.duplicates.map((group) => (
+                    <section key={`${group.source}-${group.key}`}>
+                      <strong>{group.source} · {group.key}（{group.rows.length} 筆）</strong>
+                      <ul>
+                        {group.rows.map((row) => (
+                          <li key={row.position}>
+                            第 {row.position} 筆資料 · {row.orderID}
+                            {row.repairID && ` · 維修 ${row.repairID}`} · {row.status}
+                          </li>
+                        ))}
+                      </ul>
+                    </section>
+                  ))}
+                </div>
+              </details>
+            </aside>
+          )}
           <div className="table-card">
             {selectedTab === 0 && currentList.length > 0 && (
               <div className="table-actions">
@@ -563,32 +557,49 @@ export default function App() {
                           </td>
                         )}
                         <td>
-                          <span
-                            className="id-cell"
-                            onClick={() => copyToClipboard(row.gsxID)}
-                          >
-                            {row.gsxID}
-                            <button
-                              title="開啟 GSX"
-                              onClick={(event) => event.stopPropagation()}
+                          <span className="id-cell">
+                            <a
+                              className="id-link"
+                              href={`https://gsx2.apple.com/repairs/${row.gsxID}`}
+                              target="_blank"
+                              rel="noreferrer"
+                              title="在 GSX 開啟維修單"
                             >
-                              <a
-                                href={`https://gsx2.apple.com/repairs/${row.gsxID}`}
-                                target="_blank"
-                                rel="noreferrer"
-                              >
-                                <Icon name="external" size={12} />
-                              </a>
+                              {row.gsxID}
+                              <Icon name="external" size={12} />
+                            </a>
+                            <button
+                              type="button"
+                              className="id-copy"
+                              title="複製 GSX 單號"
+                              aria-label={`複製 ${row.gsxID}`}
+                              onClick={() => copyToClipboard(row.gsxID)}
+                            >
+                              <Icon name="clipboard" size={12} />
                             </button>
                           </span>
                         </td>
                         <td>
-                          <span
-                            className="id-cell muted"
-                            onClick={() => copyToClipboard(row.rmaID)}
-                          >
-                            {row.rmaID}
-                            <Icon name="clipboard" size={12} />
+                          <span className="id-cell muted">
+                            <a
+                              className="id-link"
+                              href={rmaTicketUrl(row.rmaID)}
+                              target="_blank"
+                              rel="noreferrer"
+                              title="在 Studio ARMA 開啟 RMA 工單"
+                            >
+                              {row.rmaID}
+                              <Icon name="external" size={12} />
+                            </a>
+                            <button
+                              type="button"
+                              className="id-copy"
+                              title="複製 RMA 單號"
+                              aria-label={`複製 ${row.rmaID}`}
+                              onClick={() => copyToClipboard(row.rmaID)}
+                            >
+                              <Icon name="clipboard" size={12} />
+                            </button>
                           </span>
                         </td>
                         <td>
@@ -642,8 +653,9 @@ const styles = `
   .upload-grid { display:grid; grid-template-columns:1fr 1fr; gap:14px; margin-top:16px; } .file-zone { border-radius:21px; padding:17px; min-height:92px; display:flex; align-items:center; gap:12px; transition:transform .18s ease, border-color .18s ease, background .18s ease, box-shadow .18s ease; } .file-zone:hover { transform:translateY(-1px); border-color:rgba(255,255,255,.22); background:linear-gradient(135deg, rgba(255,255,255,.13), rgba(255,255,255,.055)); } .file-zone.is-dragging { transform:scale(1.01); border-color:rgba(84,170,255,.8); background:rgba(32,129,230,.15); box-shadow:inset 0 1px rgba(255,255,255,.25), 0 0 0 3px rgba(18,132,255,.12); } .file-zone.has-file .file-icon { color:#44df74; background:rgba(48,209,88,.12); border-color:rgba(48,209,88,.2); } .file-zone input { display:none; } .file-icon { display:grid; place-items:center; flex:0 0 auto; width:42px; height:42px; color:#8dcaff; border:1px solid rgba(145,205,255,.2); border-radius:14px; background:rgba(70,154,232,.12); } .file-copy { min-width:0; display:flex; flex-direction:column; gap:4px; } .file-copy strong { font-size:14px; } .file-copy span { overflow:hidden; color:rgba(235,235,245,.52); font-size:11px; text-overflow:ellipsis; white-space:nowrap; } .quiet-button { margin-left:auto; padding:7px 10px; flex:0 0 auto; color:rgba(255,255,255,.9); font-size:11px; font-weight:600; border:1px solid rgba(255,255,255,.12); border-radius:9px; background:rgba(255,255,255,.06); transition:background .16s ease; } .quiet-button:hover { background:rgba(255,255,255,.13); }
   .primary-button { display:inline-flex; align-items:center; justify-content:center; gap:8px; color:white; border:1px solid rgba(255,255,255,.27); border-radius:999px; background:linear-gradient(180deg, #1594ff, #0672df); box-shadow:inset 0 1px rgba(255,255,255,.39), inset 0 -1px rgba(0,0,0,.17), 0 10px 25px rgba(0,107,221,.26); font-size:13px; font-weight:700; transition:transform .16s ease, filter .16s ease, box-shadow .16s ease; } .primary-button:hover:not(:disabled) { filter:brightness(1.08); box-shadow:inset 0 1px rgba(255,255,255,.42), 0 13px 30px rgba(0,107,221,.36); } .primary-button:active:not(:disabled) { transform:scale(.985); } .primary-button:disabled { opacity:.43; } .analyze-button { width:100%; min-height:46px; margin:16px 0 38px; } .spinner { width:16px; height:16px; border:2px solid rgba(255,255,255,.35); border-top-color:white; border-radius:50%; animation:spin .65s linear infinite; }
   .results-head { display:flex; align-items:end; justify-content:space-between; gap:18px; margin:0 4px 13px; } .results-head h2 { margin:3px 0 0; font-size:22px; letter-spacing:-.04em; } .segmented { padding:4px; display:flex; gap:2px; border:1px solid rgba(255,255,255,.1); border-radius:999px; background:rgba(255,255,255,.05); box-shadow:inset 0 1px rgba(255,255,255,.1), 0 8px 20px rgba(0,0,0,.13); backdrop-filter:blur(24px); } .segmented button { display:flex; gap:6px; align-items:center; border:0; padding:7px 10px; border-radius:999px; color:rgba(235,235,245,.58); background:transparent; font-size:11px; white-space:nowrap; transition:color .16s ease, background .16s ease, box-shadow .16s ease; } .segmented button:hover { color:#fff; } .segmented button.active { color:#fff; background:linear-gradient(180deg, rgba(255,255,255,.2), rgba(255,255,255,.09)); box-shadow:inset 0 1px rgba(255,255,255,.25), 0 2px 7px rgba(0,0,0,.17); } .segmented b { min-width:16px; padding:1px 5px; color:#fff; border-radius:999px; background:rgba(255,255,255,.13); font-size:10px; } .segmented b.red { background:rgba(255,69,58,.78); } .segmented b.orange { background:rgba(255,159,10,.78); color:#251600; }
+  .duplicate-warning { margin:0 0 16px; padding:16px 20px; border:1px solid rgba(255,159,10,.35); border-radius:18px; background:rgba(255,159,10,.08); color:#ffd29a; font-size:12px; overflow-wrap:anywhere; } .duplicate-warning h3 { display:flex; align-items:center; gap:8px; margin:0 0 8px; font-size:14px; } .duplicate-warning p { margin:0 0 10px; line-height:1.6; } .duplicate-warning summary { cursor:pointer; padding:4px 0; } .duplicate-details { max-height:280px; overflow:auto; margin-top:12px; } .duplicate-details section + section { margin-top:14px; } .duplicate-details ul { margin:6px 0 0; padding-left:20px; line-height:1.8; }
   .table-card { overflow:hidden; min-height:404px; border-radius:25px; } .table-actions { min-height:59px; padding:11px 16px 11px 20px; display:flex; align-items:center; justify-content:space-between; gap:14px; border-bottom:1px solid rgba(255,255,255,.08); background:rgba(255,255,255,.028); color:rgba(235,235,245,.57); font-size:12px; } .table-actions b { color:#fff; } .table-actions > div { display:flex; gap:8px; } .small-button, .export-button { border-radius:9px; font-size:11px; font-weight:650; transition:filter .16s ease, transform .16s ease; } .small-button { padding:7px 10px; color:#fff; border:1px solid rgba(255,255,255,.11); background:rgba(255,255,255,.08); } .export-button { display:inline-flex; align-items:center; gap:6px; padding:7px 11px; color:#052b16; border:1px solid rgba(195,255,209,.39); background:linear-gradient(180deg, #50e37a, #30c85e); box-shadow:inset 0 1px rgba(255,255,255,.38); } .small-button:hover, .export-button:hover { filter:brightness(1.08); } .small-button:active, .export-button:active { transform:scale(.98); }
-  .table-scroll { overflow:auto; } table { width:100%; min-width:790px; border-collapse:collapse; text-align:left; } th { position:sticky; top:0; z-index:1; padding:13px 18px; color:rgba(235,235,245,.48); border-bottom:1px solid rgba(255,255,255,.075); background:rgba(22,29,39,.73); box-shadow:inset 0 -1px rgba(255,255,255,.035); backdrop-filter:blur(24px); font-size:10px; font-weight:700; letter-spacing:.045em; text-transform:uppercase; } td { padding:13px 18px; border-bottom:1px solid rgba(255,255,255,.06); color:rgba(245,245,247,.84); font-size:12px; } tbody tr { transition:background .15s ease; } tbody tr:last-child td { border-bottom:0; } tbody tr:hover { background:rgba(255,255,255,.043); } .check-col { width:66px; text-align:center; } input[type=checkbox] { appearance:none; width:16px; height:16px; vertical-align:middle; border:1px solid rgba(255,255,255,.27); border-radius:5px; background:rgba(0,0,0,.14); transition:all .13s ease; } input[type=checkbox]:checked { border-color:#0a84ff; background:#0a84ff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='m5 12 4 4L19 6' fill='none' stroke='white' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center/12px no-repeat; box-shadow:0 0 0 3px rgba(10,132,255,.12); } .id-cell { display:inline-flex; align-items:center; gap:7px; color:#f4f7ff; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; font-weight:600; cursor:copy; } .id-cell:hover { color:#7fc5ff; } .id-cell button { display:grid; place-items:center; padding:3px; opacity:0; border:0; border-radius:5px; color:#c9e6ff; background:rgba(255,255,255,.1); transition:opacity .15s; } tr:hover .id-cell button { opacity:1; } .id-cell a { color:inherit; line-height:0; } .id-cell.muted { color:rgba(235,235,245,.66); } .badge { display:inline-flex; max-width:178px; padding:4px 8px; overflow:hidden; border:1px solid; border-radius:999px; text-overflow:ellipsis; white-space:nowrap; font-size:10px; font-weight:650; backdrop-filter:blur(12px); } .badge.neutral { color:#c6c6c8; border-color:rgba(199,199,204,.18); background:rgba(199,199,204,.1); } .badge.green { color:#63ed8a; border-color:rgba(48,209,88,.22); background:rgba(48,209,88,.1); } .badge.blue { color:#80c9ff; border-color:rgba(10,132,255,.22); background:rgba(10,132,255,.1); } .sa-status { color:rgba(255,255,255,.78); } .reason, .clear { display:inline-flex; align-items:center; gap:6px; font-size:11px; } .reason { color:#ffc477; } .reason i { display:block; width:6px; height:6px; border-radius:50%; background:#ff9f0a; box-shadow:0 0 0 3px rgba(255,159,10,.12); } .clear { color:#68e991; }
+  .table-scroll { overflow:auto; } table { width:100%; min-width:790px; border-collapse:collapse; text-align:left; } th { position:sticky; top:0; z-index:1; padding:13px 18px; color:rgba(235,235,245,.48); border-bottom:1px solid rgba(255,255,255,.075); background:rgba(22,29,39,.73); box-shadow:inset 0 -1px rgba(255,255,255,.035); backdrop-filter:blur(24px); font-size:10px; font-weight:700; letter-spacing:.045em; text-transform:uppercase; } td { padding:13px 18px; border-bottom:1px solid rgba(255,255,255,.06); color:rgba(245,245,247,.84); font-size:12px; } tbody tr { transition:background .15s ease; } tbody tr:last-child td { border-bottom:0; } tbody tr:hover { background:rgba(255,255,255,.043); } .check-col { width:66px; text-align:center; } input[type=checkbox] { appearance:none; width:16px; height:16px; vertical-align:middle; border:1px solid rgba(255,255,255,.27); border-radius:5px; background:rgba(0,0,0,.14); transition:all .13s ease; } input[type=checkbox]:checked { border-color:#0a84ff; background:#0a84ff url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 24 24'%3E%3Cpath d='m5 12 4 4L19 6' fill='none' stroke='white' stroke-width='3' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E") center/12px no-repeat; box-shadow:0 0 0 3px rgba(10,132,255,.12); } .id-cell { display:inline-flex; align-items:center; gap:7px; color:#f4f7ff; font-family:ui-monospace, SFMono-Regular, Menlo, monospace; font-size:11px; font-weight:600; } .id-link { display:inline-flex; align-items:center; gap:5px; color:inherit; line-height:1; text-decoration:none; } .id-link:hover { color:#7fc5ff; text-decoration:underline; text-underline-offset:3px; } .id-copy { display:grid; place-items:center; padding:3px; border:0; border-radius:5px; color:#c9e6ff; background:rgba(255,255,255,.1); opacity:0; transition:opacity .15s; } tr:hover .id-copy, .id-copy:focus-visible { opacity:1; } .id-cell.muted { cursor:copy; color:rgba(235,235,245,.66); } .badge { display:inline-flex; max-width:178px; padding:4px 8px; overflow:hidden; border:1px solid; border-radius:999px; text-overflow:ellipsis; white-space:nowrap; font-size:10px; font-weight:650; backdrop-filter:blur(12px); } .badge.neutral { color:#c6c6c8; border-color:rgba(199,199,204,.18); background:rgba(199,199,204,.1); } .badge.green { color:#63ed8a; border-color:rgba(48,209,88,.22); background:rgba(48,209,88,.1); } .badge.blue { color:#80c9ff; border-color:rgba(10,132,255,.22); background:rgba(10,132,255,.1); } .sa-status { color:rgba(255,255,255,.78); } .reason, .clear { display:inline-flex; align-items:center; gap:6px; font-size:11px; } .reason { color:#ffc477; } .reason i { display:block; width:6px; height:6px; border-radius:50%; background:#ff9f0a; box-shadow:0 0 0 3px rgba(255,159,10,.12); } .clear { color:#68e991; }
   .empty-state { height:404px; display:flex; flex-direction:column; align-items:center; justify-content:center; color:rgba(235,235,245,.5); text-align:center; } .empty-state span { display:grid; place-items:center; width:48px; height:48px; margin-bottom:12px; color:rgba(235,235,245,.6); border:1px solid rgba(255,255,255,.1); border-radius:16px; background:rgba(255,255,255,.04); } .empty-state strong { color:rgba(255,255,255,.8); font-size:13px; } .empty-state p { margin:5px 0 0; font-size:11px; } footer { margin:22px 0 0; color:rgba(235,235,245,.32); text-align:center; font-size:10px; }
   .modal-backdrop { position:fixed; z-index:20; inset:0; display:grid; place-items:center; padding:18px; background:rgba(0,0,0,.36); backdrop-filter:blur(24px); } .liquid-modal { width:min(440px, 100%); padding:27px; border:1px solid rgba(255,255,255,.2); border-radius:28px; background:linear-gradient(145deg, rgba(255,255,255,.16), rgba(255,255,255,.065)); box-shadow:inset 0 1px rgba(255,255,255,.3), inset 0 -1px rgba(255,255,255,.04), 0 35px 100px rgba(0,0,0,.46); backdrop-filter:blur(50px) saturate(185%); animation:modal-in .24s ease-out; } .modal-title { display:flex; gap:12px; align-items:flex-start; } .warning-icon { display:grid; place-items:center; flex:0 0 auto; width:38px; height:38px; color:#ffb340; border:1px solid rgba(255,179,64,.24); border-radius:13px; background:rgba(255,159,10,.12); } .modal-title h2 { margin:1px 0 5px; font-size:16px; letter-spacing:-.025em; } .modal-title p { margin:0; color:rgba(235,235,245,.58); font-size:11px; line-height:1.45; } .status-list { display:flex; flex-wrap:wrap; gap:6px; margin:20px 0; padding:12px; border:1px solid rgba(255,255,255,.08); border-radius:15px; background:rgba(0,0,0,.11); } .status-list span { padding:4px 7px; color:rgba(245,245,247,.69); border-radius:7px; background:rgba(255,255,255,.06); font-size:10px; } .modal-action { width:100%; min-height:40px; }
   .toast { position:fixed; z-index:30; left:50%; bottom:24px; display:flex; align-items:center; gap:8px; padding:10px 13px; color:#fff; border:1px solid rgba(255,255,255,.18); border-radius:14px; background:rgba(35,39,47,.78); box-shadow:inset 0 1px rgba(255,255,255,.18), 0 12px 28px rgba(0,0,0,.3); backdrop-filter:blur(24px); font-size:12px; opacity:0; transform:translate(-50%, 14px) scale(.97); pointer-events:none; transition:opacity .2s ease, transform .2s ease; } .toast.visible { opacity:1; transform:translate(-50%, 0) scale(1); } .toast span { display:grid; place-items:center; width:20px; height:20px; color:#063616; border-radius:50%; background:#49dd74; }
